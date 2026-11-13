@@ -8,13 +8,18 @@ for json_path in map(Path, sys.argv[1:]):
     d = json.loads(json_path.read_text())
     lines = [f"## {json_path.stem}", "", "| Metric | Value |", "|---|---|"]
     lines += [f"| {k} | {v:.4f} |" for k, v in d["overall"].items()]
-    lines += ["", "| id | class | GT | AP50:95 | AR | F1 | P | R |", "|---:|---|---:|---:|---:|---:|---:|---:|"]
+    lines += [
+        "",
+        "| id | class | GT | AP50:95 | AP50 | AR | F1 | P | R |",
+        "|---:|---|---:|---:|---:|---:|---:|---:|---:|",
+    ]
     for cid, m in d["per_class"].items():
         if m["num_gt"] == 0:  # 沒有 GT 的類別（AP=-1）不列
             continue
         name = d["class_names"][int(cid)] if int(cid) < len(d["class_names"]) else "(background slot)"
+        ap50 = f"{m['ap50']:.4f}" if "ap50" in m else "-"  # 舊版 eval.py 的 JSON 沒有 ap50
         lines.append(
-            f"| {cid} | {name} | {m['num_gt']} | {m['ap']:.4f} | {m['ar']:.4f} "
+            f"| {cid} | {name} | {m['num_gt']} | {m['ap']:.4f} | {ap50} | {m['ar']:.4f} "
             f"| {m['f1']:.4f} | {m['precision']:.4f} | {m['recall']:.4f} |"
         )
     out = json_path.with_suffix(".md")

@@ -1,0 +1,198 @@
+# 實驗 B + 自訂增強：RETFound-DINOv2 ViT-L/14 + LoRA + cosine（同 configs/rfdetr_retfound_fundus_lora.yaml），
+# 另外加上 aug_config（翻轉、旋轉 90 度、Affine、ColorJitter）。跟 lora_cosine 只差在資料增強。
+# 執行（PowerShell，在 repo 根目錄）：
+#   $env:PYTHONUTF8 = "1"; $env:PYTHONPATH = "src;."
+#   $env:RETFOUND_WEIGHTS = "D:\pretrained_weights\retfound_dinov2_shanghai_hf.pth"
+#   python -m rfdetr fit --config configs/rfdetr_retfound_fundus_lora_aug.yaml
+model:
+  # ==========================================================================
+  # model_config：模型本身（等同 RFDETRSmall(...) 建構子的參數）
+  # ==========================================================================
+  model_config:
+    class_path: my_backbones.retfound.RFDETRRETFoundConfig
+    init_args:
+      num_classes: 12 # JY11302_crop_12cls，跟 jy11302_12cls_baseline 一樣
+
+      # ---- 權重 ----
+      # decoder/head 從去掉 backbone 的 rf-detr-small 開始；encoder 由 RETFOUND_WEIGHTS 載入
+      pretrain_weights: D:\pretrained_weights\rf-detr-small-nobackbone.pth
+
+      # ---- 輸入 ----
+      resolution: 812                       # 最接近 baseline 800 的 28 倍數；必須是 patch_size * num_windows（=28）的倍數
+      positional_encoding_size: 58          # = resolution / 14，CLI 不會自動算
+      #   CLI 改 resolution 時要同時設 positional_encoding_size = resolution / 14（例：560 → 40），
+      #   CLI 不會自動推算（Python API 會）。
+      # num_channels: 3                       # 輸入通道數
+
+      # ---- 記憶體 / 速度 ----
+      gradient_checkpointing: true          # encoder 要算梯度了，開啟省顯存（已驗證不影響 LoRA 梯度）
+      # compile: false                        # torch.compile
+      # cuda_graphs: false                    # 單 GPU CUDA graph 重播（僅偵測、BF16）
+      # fused_optimizer: true                 # 使用 fused AdamW
+      freeze_encoder: false                 # LoRA 會自己凍結 ViT 原本的權重，只訓練 LoRA 參數
+      backbone_lora: true                   # 實驗 B：DoRA r=16 加在 query/key/value（需 peft）
+      # device: cuda                          # 只影響建模；CLI 用哪張卡請用 trainer.devices 或 CUDA_VISIBLE_DEVICES
+
+      # ---- 推論後處理 ----
+      # num_select: 300                       # 後處理保留的最多偵測數
+
+      # ---- 架構參數：使用預訓練權重時不要改，否則權重對不上 ----
+      # encoder: retfound_dinov2_large
+      # out_feature_indexes: [6, 12, 18, 24]  # ViT-L 共 24 層（stageN = 第 N 層之後的輸出）
+      # dec_layers: 3
+      # two_stage: true
+      # projector_scale: [P4]                 # 維持 P4，decoder 預訓練權重才對得上
+      # hidden_dim: 256
+      # patch_size: 14
+      # num_windows: 2
+      # sa_nheads: 8
+      # ca_nheads: 16
+      # dec_n_points: 2
+      # dim_feedforward: 2048
+      # num_queries: 300
+      # group_detr: 13
+      # bbox_reparam: true
+      # lite_refpoint_refine: true
+      # layer_norm: true
+      # ia_bce_loss: true
+      # num_decoder_registers: 0
+      # postprocess_trace_alpha: 0.2
+
+  # ==========================================================================
+  # train_config：訓練參數（等同 model.train(...) 的參數）
+  # ==========================================================================
+  train_config:
+    class_path: rfdetr.config.TrainConfig
+    init_args:
+      dataset_dir: D:\data\rf-detr\JY11302_crop_12cls
+      output_dir: D:\exp_result\fundus\rfdetr-retfound\JY11302_12cls_lora_cosine_aug
+      # dataset_file: roboflow                # roboflow | coco | yolo | o365 | webdataset
+      # class_names: null                     # 指定類別名稱；null = 從資料集讀
+      num_workers: 4                        # DataLoader worker 數
+
+      # ---- 訓練長度與 batch ----
+      epochs: 30 # 跟 baseline 一樣
+      batch_size: 2 # 4070 12GB + ViT-L @812；顯存有餘可改 4 / accum 4
+      grad_accum_steps: 8 # 有效 batch = 2 * 8 = 16，跟 baseline 一樣
+      # eval_batch_size: null                 # 驗證/測試 batch；null = 跟 batch_size 一樣
+      # auto_batch_target_effective: 16       # 以下三個只在 batch_size: auto 時有用（CLI 不適用）
+      # auto_batch_max_targets_per_image: 100
+      # auto_batch_ema_headroom: 0.7
+      # resume: null                          # 接續訓練的 checkpoint 路徑（last.ckpt 會恢復 optimizer 狀態）
+
+      # ---- 學習率與優化器 ----
+      lr: 1.0e-4 # 主學習率（encoder 以外）
+      lr_encoder: 1.0e-4                    # LoRA 參數的學習率；LoRA 只有 ~2.4M 參數，可以比全部微調大
+      lr_vit_layer_decay: 0.95              # 第一層 lr = 0.95^25 ≈ 28%（0.9 會只剩 7%，前段 LoRA 幾乎不學）
+      # lr_component_decay: 0.7               # 各元件學習率衰減
+      # weight_decay: 1.0e-4
+      # optimizer: adamw                      # torch.optim 短名稱（adamw/sgd）或完整 import 路徑
+      # optimizer_kwargs: {}
+      lr_scheduler: cosine                  # 跟 jy11302_12cls_baseline 一樣（範本預設 step 在 30 epoch 內不會降 lr）
+      # lr_scheduler_kwargs: {}               # step/cosine 可設 lr_drop（預設 100）、min_factor（預設 0.0）
+      # lr_scheduler_interval: step           # step | epoch（只對自訂 scheduler 有效）
+      # lr_scheduler_monitor: val/loss        # 給 ReduceLROnPlateau 用
+      warmup_epochs: 0.0                    # 跟 jy11302_12cls_baseline 一樣
+      # clip_max_norm: 0.1                    # 梯度裁剪；0 = 不裁剪
+
+      # ---- 正則化與 loss ----
+      drop_path: 0.1                        # backbone stochastic depth
+      # cls_loss_coef: 1.0                    # 分類 loss 權重
+
+      # ---- 資料增強 ----
+      # multi_scale: PER_BATCH                # PER_BATCH | PER_SAMPLE | 'OFF'（CLI 要寫大寫名稱；OFF 必須加引號，否則 YAML 會讀成 false）
+      # expanded_scales: true                 # 多尺度訓練用較廣的尺度範圍
+      # scale_jitter: true
+      # square_resize_div_64: true
+      # augmentation_backend: cpu             # cpu | auto | gpu | torchvision
+      aug_config:                           # 自訂 Albumentations 增強（設了就取代預設的 HorizontalFlip）
+        HorizontalFlip:
+          p: 0.5
+        VerticalFlip:
+          p: 0.5
+        Rotate:                             # 只轉 90 度（同 jy11302_12cls_aug90）
+          limit: [90, 90]
+          p: 0.5
+        Affine:                             # = torchvision RandomAffine(degrees=5, translate=(0.05, 0.05), scale=(0.95, 1.05))
+          rotate: [-5, 5]
+          translate_percent: [-0.05, 0.05]
+          scale: [0.95, 1.05]
+          p: 1.0                            # torchvision 版每張都套用；Albumentations 預設只有 0.5
+        ColorJitter:                        # = torchvision ColorJitter(brightness=0.1, contrast=0.1, saturation=0.5)
+          brightness: 0.1
+          contrast: 0.1
+          saturation: 0.5
+          hue: 0.0                          # 一定要寫：Albumentations 預設 hue=±0.5，會把眼底的紅色轉成別的顏色
+          p: 1.0                            # torchvision 版每張都套用；Albumentations 預設只有 0.5
+      # save_dataset_grids: false             # 存下增強後的樣本網格圖，方便檢查
+
+      # ---- 精度 ----
+      amp_dtype: auto                       # auto | bf16 | fp16 | fp8 | null（GPU 不支援 bf16 就改 fp16）
+
+      # ---- EMA ----
+      # use_ema: true
+      # ema_decay: 0.993
+      # ema_tau: 100
+      # ema_update_interval: 1
+
+      # ---- Checkpoint 與最佳模型 ----
+      # checkpoint_interval: 10               # 每 N 個 epoch 存一次 checkpoint_<epoch>.ckpt
+      # best_model_metric: map                # map | mar
+      # skip_best_epochs: 0                   # 前 N 個 epoch 不參與最佳模型 / early stopping 判斷
+      # smooth_alpha: 0.0                     # 選最佳模型時對指標做 EMA 平滑，範圍 [0, 1)
+      # dont_save_weights: false
+
+      # ---- Early stopping ----
+      # early_stopping: false
+      # early_stopping_patience: 10
+      # early_stopping_min_delta: 0.001
+      # early_stopping_use_ema: false
+
+      # ---- 驗證 / 測試 ----
+      # eval_interval: 1                      # 每 N 個 epoch 驗證一次（最後一個 epoch 一定驗證）
+      # eval_max_dets: 500
+      # eval_backend: vernier                 # vernier | hotcoco | hotcoco_streaming | faster_coco_eval | ufcoco
+      # eval_base_model: false                # 除了 EMA 也評估原始權重
+      log_per_class_metrics: true          # 輸出每個類別的 AP
+      # run_test: false                       # 訓練結束後跑 test split
+      compute_val_loss: true                # auto | true | false
+      # compute_test_loss: true
+      # num_sanity_val_steps: 0               # 開訓前先跑幾個驗證 batch 檢查
+      # eval_masks_head_resolution: false     # 分割專用
+
+      # ---- 記錄 ----
+      progress_bar: rich                   # tqdm | rich | null
+      # tensorboard: true                     # 需 pip install tensorboard
+      # wandb: false
+      # mlflow: false
+      # clearml: false                        # 尚未實作
+      # project: null                         # W&B 專案名稱
+      # run: null                             # W&B run 名稱
+      # notes: null                           # 寫進 checkpoint 的自訂備註
+      # train_log_on_step: false
+      # train_log_sync_dist: false
+      # compact_train_metrics: true
+      # compute_train_metrics: false
+
+      # ---- 硬體 / 分散式 ----
+      # accelerator: auto                     # auto | gpu | cpu | mps
+      # devices: 1                            # GPU 數；也可用 trainer.devices 覆蓋
+      # strategy: auto                        # auto | ddp | fsdp ...
+      # num_nodes: 1
+      # sync_bn: false
+      # seed: null                            # 固定亂數種子
+
+      # ---- DataLoader 調校 ----
+      # pin_memory: null
+      # persistent_workers: null
+      # prefetch_factor: null
+      # pack_targets: true
+      # pad_targets_to: null                  # TPU/XLA 用
+
+# ============================================================================
+# trainer：直接覆蓋 PyTorch Lightning Trainer 的設定（可選）
+# 大部分已由 train_config 決定；改 epoch 請用 train_config.epochs，不要用 max_epochs
+# ============================================================================
+# trainer:
+#   devices: 1
+#   callbacks: []

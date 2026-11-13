@@ -135,8 +135,16 @@ def predict_with_checkpoint(
     ``threshold=0.0`` keeps every detection PostProcess returns (top ``num_select``), as training evaluation does.
     """
     from rfdetr import RFDETR  # 只有 checkpoint 模式需要載入模型
+    from rfdetr.utilities.io import _safe_torch_load
 
-    model = RFDETR.from_checkpoint(str(checkpoint))
+    saved_config = _safe_torch_load(checkpoint).get("model_config") or {}
+    if saved_config.get("encoder") == "retfound_dinov2_large":
+        # 自訂 encoder：from_checkpoint 不認得這個 model_name，改用 RFDETRRETFound 直接載整個 checkpoint
+        from my_backbones.retfound import RFDETRRETFound
+
+        model: RFDETR = RFDETRRETFound(pretrain_weights=str(checkpoint), resolution=saved_config.get("resolution", 504))
+    else:
+        model = RFDETR.from_checkpoint(str(checkpoint))
     stems = list(images)
     preds: dict[str, Sample] = {}
     for start in tqdm(range(0, len(stems), batch_size), desc="predict"):
@@ -163,9 +171,31 @@ def save_yolo_txt(pred: Sample, path: Path, width: int, height: int) -> None:
     path.write_text("\n".join(lines) + ("\n" if lines else ""))
 
 
+class _PerClassAP50Metric(OnePassCocoMeanAveragePrecision):
+    """``OnePassCocoMeanAveragePrecision`` that also returns per-class AP at IoU 0.50 (``map_50_per_class``).
+
+    The parent averages each class's precision over every IoU threshold (AP50:95); this reads the same precision
+    array at the IoU = 0.50 slice only, so the numbers come from the identical evaluation.
+    """
+
+    def _reduce_per_class(self, evaluation: Any, prefix: str, classes: list[int]) -> dict[str, torch.Tensor]:
+        result = super()._reduce_per_class(evaluation, prefix, classes)
+        if not self.class_metrics:
+            return result
+        iou_index = next(i for i, t in enumerate(self.iou_thresholds) if abs(t - 0.5) < 1e-6)
+        precision = np.asarray(evaluation["precision"])  # [IoU, recall, class, area, max_dets]
+        ap50: list[float] = []
+        for class_index in range(len(classes)):
+            p = precision[iou_index, :, class_index, 0, -1]
+            valid = p[p > -1]
+            ap50.append(float(valid.mean()) if valid.size else -1.0)
+        result[f"{prefix}map_50_per_class"] = torch.tensor(ap50, dtype=torch.float32)
+        return result
+
+
 def evaluate(preds: list[Sample], targets: list[Sample], max_dets: int, chunk: int = 64) -> dict[str, Any]:
     """Compute mAP/mAR and the F1 sweep exactly as ``COCOEvalCallback`` does for one split."""
-    metric = OnePassCocoMeanAveragePrecision(
+    metric = _PerClassAP50Metric(
         iou_type="bbox",
         class_metrics=True,
         max_detection_thresholds=[1, 10, max_dets],
@@ -182,8 +212,13 @@ def evaluate(preds: list[Sample], targets: list[Sample], max_dets: int, chunk: i
     mar_key = f"mar_{max_dets}"
     classes = result["classes"].tolist()
     per_class: dict[int, dict[str, float]] = {
-        cid: {"ap": float(ap), "ar": float(ar)}
-        for cid, ap, ar in zip(classes, result["map_per_class"].tolist(), result[f"{mar_key}_per_class"].tolist())
+        cid: {"ap": float(ap), "ap50": float(ap50), "ar": float(ar)}
+        for cid, ap, ap50, ar in zip(
+            classes,
+            result["map_per_class"].tolist(),
+            result["map_50_per_class"].tolist(),
+            result[f"{mar_key}_per_class"].tolist(),
+        )
     }
 
     # F1 sweep: same as COCOEvalCallback._compute_and_log_f1_metrics
@@ -228,14 +263,15 @@ def format_report(metrics: dict[str, Any], class_names: list[str], header: list[
     lines.append("")
     lines += [f"{k:<16}{v:.4f}" for k, v in metrics["overall"].items()]
     lines.append("")
-    lines.append(f"{'id':>3} {'class':<40}{'GT':>7}{'AP50:95':>9}{'AR':>8}{'F1':>8}{'P':>8}{'R':>8}")
+    lines.append(f"{'id':>3} {'class':<40}{'GT':>7}{'AP50:95':>9}{'AP50':>8}{'AR':>8}{'F1':>8}{'P':>8}{'R':>8}")
     for cid in sorted(metrics["per_class"]):
         m = metrics["per_class"][cid]
         # RF-DETR 的分類頭多一個 background slot（id = num_classes），訓練評估也會把它算進來；沒有 GT 所以不影響 mAP/F1
         name = class_names[cid] if cid < len(class_names) else "(background slot)"
         # AP/AR = -1 表示這個類別沒有 GT
         lines.append(
-            f"{cid:>3} {name:<40}{m.get('num_gt', 0):>7}{m.get('ap', -1):>9.4f}{m.get('ar', -1):>8.4f}"
+            f"{cid:>3} {name:<40}{m.get('num_gt', 0):>7}{m.get('ap', -1):>9.4f}{m.get('ap50', -1):>8.4f}"
+            f"{m.get('ar', -1):>8.4f}"
             f"{m.get('f1', 0):>8.4f}{m.get('precision', 0):>8.4f}{m.get('recall', 0):>8.4f}"
         )
     return "\n".join(lines)
