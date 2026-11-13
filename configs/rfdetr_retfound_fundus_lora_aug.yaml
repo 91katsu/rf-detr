@@ -1,5 +1,6 @@
 # 實驗 B + 自訂增強：RETFound-DINOv2 ViT-L/14 + LoRA + cosine（同 configs/rfdetr_retfound_fundus_lora.yaml），
-# 另外加上 aug_config（翻轉、旋轉 90 度、Affine、ColorJitter）。跟 lora_cosine 只差在資料增強。
+# 另外加上 aug_config（水平/垂直翻轉、Affine、ColorJitter）。跟 lora_cosine 只差在資料增強。
+# 不做 90 度旋轉：眼底照片方向固定（視盤在左右側），旋轉 90 度會產生臨床上不會出現的影像。
 # 執行（PowerShell，在 repo 根目錄）：
 #   $env:PYTHONUTF8 = "1"; $env:PYTHONPATH = "src;."
 #   $env:RETFOUND_WEIGHTS = "D:\pretrained_weights\retfound_dinov2_shanghai_hf.pth"
@@ -109,9 +110,6 @@ model:
         HorizontalFlip:
           p: 0.5
         VerticalFlip:
-          p: 0.5
-        Rotate:                             # 只轉 90 度（同 jy11302_12cls_aug90）
-          limit: [90, 90]
           p: 0.5
         Affine:                             # = torchvision RandomAffine(degrees=5, translate=(0.05, 0.05), scale=(0.95, 1.05))
           rotate: [-5, 5]
